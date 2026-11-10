@@ -3,6 +3,8 @@ import logging
 import os
 import re
 import secrets
+import time
+from threading import Lock
 from typing import Any
 from uuid import UUID, uuid4
 from decimal import Decimal
@@ -14,7 +16,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from memwal import MemWal, RecallParams, MemWalError
 from pydantic import BaseModel, Field, field_validator
-from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 logger = logging.getLogger("orhex.api")
@@ -25,13 +28,15 @@ MEMWAL_NAMESPACE = os.getenv("MEMWAL_NAMESPACE") or "orhex-personal-memory"
 TATUM_API_KEY = os.getenv("TATUM_API_KEY", "")
 TATUM_SUI_RPC_URL = (os.getenv("TATUM_SUI_RPC_URL") or "https://sui-mainnet.gateway.tatum.io").rstrip("/")
 SUI_NETWORK = (os.getenv("SUI_NETWORK") or "mainnet").lower()
-SESSION_SECRET = os.getenv("ORHEX_SESSION_SECRET", "")
 _SUI_MAINNET_CHAIN = "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"
 _SUI_TESTNET_CHAIN = "69WiPg3DAQiwdxfncX6wYQ2siKwAe6L9BZthQea3JNMD"
+_SESSION_COOKIE_NAME = "orhex_session"
+_SESSION_MAX_AGE = 14 * 24 * 60 * 60
+_SESSION_ID_PREFIX = "v2_"
+_SESSION_ID_PATTERN = re.compile(r"v2_[A-Za-z0-9_-]{43}")
+_LEGACY_SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}")
 
 app = FastAPI(title="ORHEX API", version="0.1.0")
-if os.getenv("APP_ENV", "development").lower() == "production" and not SESSION_SECRET:
-    raise RuntimeError("ORHEX_SESSION_SECRET is required in production.")
 origins = [
     origin.strip()
     for origin in os.getenv(
@@ -46,12 +51,93 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=SESSION_SECRET or "orhex-local-development-session-key",
-    same_site="lax",
-    https_only=os.getenv("APP_ENV", "development").lower() == "production",
-)
+
+
+def _session_cookie_secure() -> bool:
+    return os.getenv("APP_ENV", "development").lower() == "production"
+
+
+class OpaqueSessionMiddleware:
+    def __init__(self, app: ASGIApp, cookie_secure: bool = False) -> None:
+        self.app = app
+        self.cookie_secure = cookie_secure
+        self.sessions: dict[str, tuple[float, dict[str, Any]]] = {}
+        self.sessions_lock = Lock()
+        self.request_count = 0
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        candidate_id = Request(scope).cookies.get(_SESSION_COOKIE_NAME, "")
+        now = time.monotonic()
+        legacy_session_unavailable = False
+        with self.sessions_lock:
+            session_entry = self.sessions.get(candidate_id)
+            if _SESSION_ID_PATTERN.fullmatch(candidate_id):
+                session_id = candidate_id
+                session_data = (
+                    session_entry[1]
+                    if session_entry is not None and session_entry[0] > now
+                    else {"orhex_session": session_id}
+                )
+            elif _LEGACY_SESSION_ID_PATTERN.fullmatch(candidate_id):
+                if session_entry is None or session_entry[0] <= now:
+                    legacy_session_unavailable = True
+                    session_id = candidate_id
+                    session_data = {}
+                else:
+                    session_id = candidate_id
+                    session_data = session_entry[1]
+            else:
+                session_id = _SESSION_ID_PREFIX + secrets.token_urlsafe(32)
+                session_data = {"orhex_session": session_id}
+
+            if not legacy_session_unavailable:
+                self.sessions[session_id] = (now + _SESSION_MAX_AGE, session_data)
+                self.request_count += 1
+                if self.request_count % 100 == 0:
+                    self.sessions = {
+                        key: value
+                        for key, value in self.sessions.items()
+                        if value[0] > now
+                    }
+
+        if legacy_session_unavailable:
+            await JSONResponse(
+                status_code=409,
+                content={
+                    "detail": (
+                        "This legacy session cannot be restored after a server "
+                        "restart. Its Walrus namespace must be migrated before "
+                        "this session can continue."
+                    )
+                },
+            )(scope, receive, send)
+            return
+
+        scope["session"] = session_data
+        cookie = (
+            f"{_SESSION_COOKIE_NAME}={session_id}; Max-Age={_SESSION_MAX_AGE}; "
+            "Path=/; HttpOnly; SameSite=Lax"
+        )
+        if self.cookie_secure:
+            cookie += "; Secure"
+
+        async def send_with_session_cookie(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                message = dict(message)
+                message["headers"] = [
+                    *message.get("headers", []),
+                    (b"set-cookie", cookie.encode("latin-1")),
+                ]
+            await send(message)
+
+        await self.app(scope, receive, send_with_session_cookie)
+
+
+app.add_middleware(OpaqueSessionMiddleware, cookie_secure=_session_cookie_secure())
 
 
 class RememberRequest(BaseModel):

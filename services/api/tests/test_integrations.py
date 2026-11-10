@@ -1,5 +1,5 @@
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -12,6 +12,7 @@ class FakeWalrusClient:
     def __init__(self) -> None:
         self.saved: dict[str, str] = {}
         self.idempotency_keys: dict[str, str] = {}
+        self.recalled_namespaces: list[str] = []
         self.closed = False
 
     async def remember(self, text: str, namespace: str, idempotency_key: str):
@@ -33,6 +34,7 @@ class FakeWalrusClient:
         )
 
     async def recall(self, params):
+        self.recalled_namespaces.append(params.namespace)
         return SimpleNamespace(
             results=[
                 SimpleNamespace(
@@ -62,9 +64,12 @@ def test_memory_isolation_confirmation_and_recall_are_session_scoped(monkeypatch
             "/memory/remember",
             json={"text": "I prefer concise updates with clear next steps."},
         )
+        session_id = first_session.cookies.get("orhex_session")
         assert saved.status_code == 200
         assert saved.json()["status"] == "confirmed"
         assert saved.json()["blob_id"] == "blob-job-1"
+        assert session_id is not None
+        assert session_id not in saved.text
 
         recalled = first_session.post(
             "/memory/recall",
@@ -72,11 +77,50 @@ def test_memory_isolation_confirmation_and_recall_are_session_scoped(monkeypatch
         )
         assert recalled.status_code == 200
         assert recalled.json()["results"][0]["text"] == fake.text
+        assert first_session.cookies.get("orhex_session") == session_id
 
-        another_session_status = TestClient(app).get("/memory/status/job-1")
+    with TestClient(app) as another_session:
+        another_session_status = another_session.get("/memory/status/job-1")
+        assert another_session.cookies.get("orhex_session") != session_id
 
     assert another_session_status.status_code == 404
     assert fake.closed
+
+
+def test_memory_namespace_survives_a_new_application_instance(monkeypatch) -> None:
+    fake = FakeWalrusClient()
+    fake.text = "Existing session memory"
+    monkeypatch.setattr(main, "MEMWAL_PRIVATE_KEY", "a" * 64)
+    monkeypatch.setattr(main, "MEMWAL_ACCOUNT_ID", "0x" + "b" * 64)
+    monkeypatch.setattr(main, "_walrus_client", lambda: fake)
+
+    with TestClient(app) as original_instance:
+        original_recall = original_instance.post(
+            "/memory/recall",
+            json={"query": "Find existing memory"},
+        )
+        session_id = original_instance.cookies.get("orhex_session")
+
+    assert original_recall.status_code == 200
+    assert session_id is not None
+    original_namespace = original_recall.json()["namespace"]
+    restarted_app = FastAPI()
+    restarted_app.include_router(app.router)
+    restarted_app.add_middleware(
+        main.OpaqueSessionMiddleware,
+        cookie_secure=False,
+    )
+    with TestClient(restarted_app) as restarted_instance:
+        restarted_instance.cookies.set("orhex_session", session_id)
+        restarted_recall = restarted_instance.post(
+            "/memory/recall",
+            json={"query": "Find existing memory"},
+        )
+
+    assert restarted_recall.status_code == 200
+    assert restarted_recall.json()["namespace"] == original_namespace
+    assert session_id not in restarted_recall.text
+    assert fake.recalled_namespaces == [original_namespace, original_namespace]
 
 
 def test_walrus_confirmation_without_blob_id_is_not_reported_as_confirmed(monkeypatch) -> None:
